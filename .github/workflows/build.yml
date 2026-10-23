@@ -45,6 +45,12 @@ jobs:
               compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
           }
 
+          tasks.register('printMcClasspath') {
+              doLast {
+                  configurations.compileClasspath.files.each { println "CP:${it}" }
+              }
+          }
+
           processResources {
               inputs.property "version", project.version
               filesMatching("fabric.mod.json") {
@@ -178,8 +184,8 @@ jobs:
 
                   ClientTickEvents.END_CLIENT_TICK.register(client -> {
                       while (openKey.consumeClick()) {
-                          if (client.screen == null) {
-                              client.setScreen(new LocateScreen(null));
+                          if (client.gui.screen() == null) {
+                              client.gui.setScreen(new LocateScreen(null));
                           }
                       }
                   });
@@ -228,7 +234,7 @@ jobs:
 
               @Override
               public void onClose() {
-                  minecraft.setScreen(parent);
+                  minecraft.gui.setScreen(parent);
               }
           }
           LOCATE_EOF
@@ -261,7 +267,7 @@ jobs:
                   int cx = width / 2;
                   int cy = height / 2;
 
-                  addRenderableWidget(new StringWidget(cx - 100, cy - 45, 200, 9, title, font).alignCenter());
+                  addRenderableWidget(new StringWidget(cx - font.width(title) / 2, cy - 45, font.width(title), 9, title, font));
 
                   keyButton = addRenderableWidget(Button.builder(label(), b -> {
                       waiting = true;
@@ -305,7 +311,7 @@ jobs:
 
               @Override
               public void onClose() {
-                  minecraft.setScreen(parent);
+                  minecraft.gui.setScreen(parent);
               }
           }
           LOCATE_EOF
@@ -337,6 +343,15 @@ jobs:
 
       - name: Build mod
         run: gradle build --stacktrace
+
+      - name: Dump Minecraft API (only on failure)
+        if: failure()
+        run: |
+          CP=$(gradle -q printMcClasspath | grep '^CP:' | sed 's/^CP://' | tr '\n' ':')
+          for c in net.minecraft.client.Minecraft net.minecraft.client.gui.Gui net.minecraft.client.gui.components.StringWidget; do
+            echo "=== $c ==="
+            javap -cp "$CP" "$c" | grep -iE 'screen|align|class ' || true
+          done
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
