@@ -2,15 +2,118 @@ name: build
 
 on:
   push:
-  pull_request:
   workflow_dispatch:
 
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - name: Create project files
+        run: |
+          cat > build.gradle <<'LOCATE_EOF'
+          plugins {
+              id 'net.fabricmc.fabric-loom'
+              id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+              archivesName = project.archives_base_name
+          }
+
+          dependencies {
+              minecraft "com.mojang:minecraft:${project.minecraft_version}"
+              implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+              implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+              inputs.property "version", project.version
+              filesMatching("fabric.mod.json") {
+                  expand "version": project.version
+              }
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+              it.options.release = 25
+          }
+
+          java {
+              withSourcesJar()
+              sourceCompatibility = JavaVersion.VERSION_25
+              targetCompatibility = JavaVersion.VERSION_25
+          }
+          LOCATE_EOF
+
+          cat > gradle.properties <<'LOCATE_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          minecraft_version=26.2
+          loader_version=0.19.5
+          loom_version=1.18.4
+          fabric_api_version=0.161.0+26.2
+
+          mod_version=1.0.0
+          maven_group=dev.chester.locategui
+          archives_base_name=locate-gui
+          LOCATE_EOF
+
+          cat > settings.gradle <<'LOCATE_EOF'
+          pluginManagement {
+              repositories {
+                  maven {
+                      name = 'Fabric'
+                      url = 'https://maven.fabricmc.net/'
+                  }
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+              plugins {
+                  id 'net.fabricmc.fabric-loom' version providers.gradleProperty('loom_version').get()
+              }
+          }
+
+          rootProject.name = 'locate-gui'
+          LOCATE_EOF
+
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'LOCATE_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "locate_gui",
+            "version": "${version}",
+            "name": "Locate GUI",
+            "description": "Button + text input analogue of /locate with RU/EN names.",
+            "license": "MIT",
+            "environment": "client",
+            "entrypoints": {
+              "client": ["dev.chester.locategui.LocateModClient"]
+            },
+            "depends": {
+              "fabricloader": ">=0.19.2",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          LOCATE_EOF
+
+          mkdir -p src/main/java/dev/chester/locategui
+          cat > src/main/java/dev/chester/locategui/LocateModClient.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import net.fabricmc.api.ClientModInitializer;
+
+          public class LocateModClient implements ClientModInitializer {
+              @Override
+              public void onInitializeClient() {
+                  System.out.println("[Locate GUI] loaded");
+              }
+          }
+          LOCATE_EOF
 
       - name: Set up JDK 25
         uses: actions/setup-java@v4
@@ -20,19 +123,16 @@ jobs:
 
       - name: Set up Gradle
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
 
-      - name: Make gradlew executable
-        run: chmod +x ./gradlew
-
-      - name: Build
-        run: ./gradlew build --no-daemon
+      - name: Build mod
+        run: gradle build
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
         with:
-          name: mod-jar
+          name: locate-gui-jar
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
-            !build/libs/*-dev.jar
-          if-no-files-found: error
