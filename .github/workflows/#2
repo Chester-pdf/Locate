@@ -1,0 +1,513 @@
+name: build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create project files
+        run: |
+          mkdir -p .
+          cat > build.gradle <<'LOCATEMOD_EOF'
+          plugins {
+          	id 'net.fabricmc.fabric-loom'
+          	id 'maven-publish'
+          }
+
+          version = project.mod_version
+          group = project.maven_group
+
+          base {
+          	archivesName = project.archives_base_name
+          }
+
+          dependencies {
+          	// 26.x — игра без обфускации, строки mappings нет.
+          	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+          	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+          	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+          }
+
+          processResources {
+          	inputs.property "version", project.version
+
+          	filesMatching("fabric.mod.json") {
+          		expand "version": project.version
+          	}
+          }
+
+          tasks.withType(JavaCompile).configureEach {
+          	it.options.release = 25
+          }
+
+          java {
+          	withSourcesJar()
+          	sourceCompatibility = JavaVersion.VERSION_25
+          	targetCompatibility = JavaVersion.VERSION_25
+          }
+          LOCATEMOD_EOF
+          mkdir -p .
+          cat > gradle.properties <<'LOCATEMOD_EOF'
+          org.gradle.jvmargs=-Xmx2G
+          org.gradle.parallel=true
+
+          # Fabric: https://fabricmc.net/develop
+          minecraft_version=26.2
+          loader_version=0.19.5
+          loom_version=1.18.4
+          fabric_api_version=0.161.0+26.2
+
+          # Mod
+          mod_version=1.0.0
+          maven_group=dev.locatemod
+          archives_base_name=locatemod
+          LOCATEMOD_EOF
+          mkdir -p .
+          cat > settings.gradle <<'LOCATEMOD_EOF'
+          pluginManagement {
+          	repositories {
+          		maven {
+          			name = 'Fabric'
+          			url = 'https://maven.fabricmc.net/'
+          		}
+          		mavenCentral()
+          		gradlePluginPortal()
+          	}
+          	plugins {
+          		id 'net.fabricmc.fabric-loom' version providers.gradleProperty('loom_version').get()
+          	}
+          }
+
+          rootProject.name = 'locatemod'
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod
+          cat > src/main/java/dev/locatemod/Aliases.java <<'LOCATEMOD_EOF'
+          package dev.locatemod;
+
+          import com.google.gson.JsonArray;
+          import com.google.gson.JsonElement;
+          import com.google.gson.JsonObject;
+          import com.google.gson.JsonParser;
+
+          import java.io.InputStreamReader;
+          import java.nio.charset.StandardCharsets;
+          import java.util.ArrayList;
+          import java.util.List;
+          import java.util.Locale;
+
+          /** Словарь «разговорное название (RU/EN) -> ID построек/биомов». Файл: resources/locatemod/aliases.json */
+          public final class Aliases {
+              public record Entry(boolean structure, List<String> names, List<String> ids) {
+                  public String displayName() {
+                      String n = names.get(0);
+                      return n.substring(0, 1).toUpperCase(Locale.ROOT) + n.substring(1);
+                  }
+              }
+
+              private static final List<Entry> ENTRIES = new ArrayList<>();
+
+              private Aliases() {}
+
+              public static void load() {
+                  ENTRIES.clear();
+                  try (var in = Aliases.class.getResourceAsStream("/locatemod/aliases.json")) {
+                      if (in == null) return;
+                      JsonArray arr = JsonParser.parseReader(new InputStreamReader(in, StandardCharsets.UTF_8)).getAsJsonArray();
+                      for (JsonElement el : arr) {
+                          JsonObject o = el.getAsJsonObject();
+                          List<String> names = new ArrayList<>();
+                          o.getAsJsonArray("names").forEach(n -> names.add(norm(n.getAsString())));
+                          List<String> ids = new ArrayList<>();
+                          o.getAsJsonArray("ids").forEach(i -> ids.add(i.getAsString()));
+                          ENTRIES.add(new Entry(o.get("kind").getAsString().equals("structure"), names, ids));
+                      }
+                  } catch (Exception e) {
+                      throw new RuntimeException("locatemod: не удалось прочитать aliases.json", e);
+                  }
+              }
+
+              public static String norm(String s) {
+                  return s.toLowerCase(Locale.ROOT).replace('ё', 'е').replace('_', ' ').replace('-', ' ').trim();
+              }
+
+              /** Сначала точное совпадение, потом частичное (для слов от 3 букв). */
+              public static Entry find(String query) {
+                  String q = norm(query);
+                  for (Entry e : ENTRIES) if (e.names().contains(q)) return e;
+                  if (q.length() >= 3) {
+                      for (Entry e : ENTRIES)
+                          for (String n : e.names())
+                              if (n.contains(q) || q.contains(n)) return e;
+                  }
+                  return null;
+              }
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod
+          cat > src/main/java/dev/locatemod/LocateMod.java <<'LOCATEMOD_EOF'
+          package dev.locatemod;
+
+          import com.mojang.datafixers.util.Pair;
+          import net.fabricmc.api.ModInitializer;
+          import net.fabricmc.fabric.api.networking.v1.PayloadTypeRegistry;
+          import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Holder;
+          import net.minecraft.core.HolderSet;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.level.biome.Biome;
+          import net.minecraft.world.level.levelgen.structure.Structure;
+
+          import java.util.ArrayList;
+          import java.util.HashSet;
+          import java.util.List;
+          import java.util.Set;
+
+          public class LocateMod implements ModInitializer {
+              private static final int STRUCTURE_RADIUS_CHUNKS = 100; // как у ванильного /locate
+              private static final int BIOME_RADIUS_BLOCKS = 6400;
+
+              @Override
+              public void onInitialize() {
+                  Aliases.load();
+                  PayloadTypeRegistry.serverboundPlay().register(LocatePayload.TYPE, LocatePayload.CODEC);
+                  ServerPlayNetworking.registerGlobalReceiver(LocatePayload.TYPE,
+                          (payload, ctx) -> handle(ctx.player(), payload.query()));
+              }
+
+              private static void handle(ServerPlayer player, String query) {
+                  ServerLevel level = (ServerLevel) player.level();
+                  BlockPos origin = player.blockPosition();
+
+                  boolean structure;
+                  List<String> ids;
+                  String title;
+
+                  Aliases.Entry entry = Aliases.find(query);
+                  if (entry != null) {
+                      structure = entry.structure();
+                      ids = entry.ids();
+                      title = entry.displayName();
+                  } else {
+                      // запасной вариант: игрок ввёл технический ID, например "trial_chambers"
+                      Identifier id = Identifier.tryParse(query.trim().toLowerCase().replace(' ', '_'));
+                      if (id == null) { notFound(player, query); return; }
+                      var structures = level.registryAccess().lookupOrThrow(Registries.STRUCTURE);
+                      var biomes = level.registryAccess().lookupOrThrow(Registries.BIOME);
+                      if (structures.get(ResourceKey.create(Registries.STRUCTURE, id)).isPresent()) {
+                          structure = true;
+                      } else if (biomes.get(ResourceKey.create(Registries.BIOME, id)).isPresent()) {
+                          structure = false;
+                      } else { notFound(player, query); return; }
+                      ids = List.of(id.getPath());
+                      title = query.trim();
+                  }
+
+                  BlockPos found = structure ? findStructure(level, origin, ids) : findBiome(level, origin, ids);
+                  if (found == null) {
+                      player.sendSystemMessage(Component.literal(
+                              title + ": не найдено поблизости (возможно, этого нет в текущем измерении)"));
+                      return;
+                  }
+                  int dist = (int) Math.round(Math.hypot(found.getX() - origin.getX(), found.getZ() - origin.getZ()));
+                  player.sendSystemMessage(Component.literal(
+                          title + ": в " + dist + " бл. отсюда (X: " + found.getX() + ", Z: " + found.getZ() + ")"));
+              }
+
+              private static void notFound(ServerPlayer player, String query) {
+                  player.sendSystemMessage(Component.literal("Не знаю такую постройку или биом: «" + query + "»"));
+              }
+
+              private static BlockPos findStructure(ServerLevel level, BlockPos origin, List<String> ids) {
+                  var reg = level.registryAccess().lookupOrThrow(Registries.STRUCTURE);
+                  List<Holder<Structure>> holders = new ArrayList<>();
+                  for (String id : ids) {
+                      reg.get(ResourceKey.create(Registries.STRUCTURE, Identifier.withDefaultNamespace(id)))
+                              .ifPresent(holders::add);
+                  }
+                  if (holders.isEmpty()) return null;
+                  Pair<BlockPos, Holder<Structure>> res = level.getChunkSource().getGenerator()
+                          .findNearestMapStructure(level, HolderSet.direct(holders), origin, STRUCTURE_RADIUS_CHUNKS, false);
+                  return res == null ? null : res.getFirst();
+              }
+
+              private static BlockPos findBiome(ServerLevel level, BlockPos origin, List<String> ids) {
+                  Set<ResourceKey<Biome>> keys = new HashSet<>();
+                  for (String id : ids) keys.add(ResourceKey.create(Registries.BIOME, Identifier.withDefaultNamespace(id)));
+                  Pair<BlockPos, Holder<Biome>> res = level.findClosestBiome3d(
+                          h -> h.unwrapKey().map(keys::contains).orElse(false),
+                          origin, BIOME_RADIUS_BLOCKS, 32, 64);
+                  return res == null ? null : res.getFirst();
+              }
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod
+          cat > src/main/java/dev/locatemod/LocatePayload.java <<'LOCATEMOD_EOF'
+          package dev.locatemod;
+
+          import net.minecraft.network.RegistryFriendlyByteBuf;
+          import net.minecraft.network.codec.ByteBufCodecs;
+          import net.minecraft.network.codec.StreamCodec;
+          import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+          import net.minecraft.resources.Identifier;
+
+          /** Клиент -> сервер: текст запроса, который ввёл игрок. */
+          public record LocatePayload(String query) implements CustomPacketPayload {
+          	public static final Type<LocatePayload> TYPE =
+          			new Type<>(Identifier.fromNamespaceAndPath("locatemod", "locate"));
+
+          	public static final StreamCodec<RegistryFriendlyByteBuf, LocatePayload> CODEC =
+          			StreamCodec.composite(ByteBufCodecs.stringUtf8(64), LocatePayload::query, LocatePayload::new);
+
+          	@Override
+          	public Type<? extends CustomPacketPayload> type() {
+          		return TYPE;
+          	}
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod/client
+          cat > src/main/java/dev/locatemod/client/LocateScreen.java <<'LOCATEMOD_EOF'
+          package dev.locatemod.client;
+
+          import dev.locatemod.LocatePayload;
+          import net.fabricmc.fabric.api.client.networking.v1.ClientPlayNetworking;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Экран с одной строкой ввода. Без собственной отрисовки, чтобы не зависеть от внутренностей GUI. */
+          public class LocateScreen extends Screen {
+          	private EditBox input;
+
+          	public LocateScreen() {
+          		super(Component.literal("Поиск"));
+          	}
+
+          	@Override
+          	protected void init() {
+          		int w = 200;
+          		int x = this.width / 2 - w / 2;
+          		int y = this.height / 2 - 40;
+
+          		// Заголовок — неактивная кнопка (лейбл без своей отрисовки).
+          		Button heading = Button.builder(Component.literal("Что найти? Постройка или биом"), b -> {})
+          				.bounds(x, y, w, 20).build();
+          		heading.active = false;
+          		this.addRenderableWidget(heading);
+
+          		this.input = new EditBox(this.font, x, y + 26, w, 20, Component.literal("Запрос"));
+          		this.input.setMaxLength(64);
+          		this.addRenderableWidget(this.input);
+          		this.setInitialFocus(this.input);
+
+          		this.addRenderableWidget(Button.builder(Component.literal("Найти"), b -> submit())
+          				.bounds(x, y + 52, 98, 20).build());
+          		this.addRenderableWidget(Button.builder(Component.literal("Отмена"), b -> this.onClose())
+          				.bounds(x + 102, y + 52, 98, 20).build());
+          	}
+
+          	private void submit() {
+          		String q = this.input.getValue().trim();
+          		if (!q.isEmpty() && ClientPlayNetworking.canSend(LocatePayload.TYPE)) {
+          			ClientPlayNetworking.send(new LocatePayload(q));
+          		}
+          		this.onClose(); // закрываем всё, чтобы был виден чат
+          	}
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod/client
+          cat > src/main/java/dev/locatemod/client/ScreenUtil.java <<'LOCATEMOD_EOF'
+          package dev.locatemod.client;
+
+          import java.lang.reflect.Field;
+          import java.lang.reflect.Method;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.client.gui.screens.Screen;
+
+          /**
+           * Открывает экран. В 26.x Mojang переименовывал этот метод (setScreen / setScreenAndShow / gui.setScreen),
+           * поэтому пробуем варианты по очереди через рефлексию — так сборка не ломается от смены имени.
+           */
+          public final class ScreenUtil {
+          	private ScreenUtil() {}
+
+          	public static void open(Screen screen) {
+          		Minecraft mc = Minecraft.getInstance();
+          		if (invoke(mc, "setScreenAndShow", screen)) return;
+          		if (invoke(mc, "setScreen", screen)) return;
+          		try {
+          			Field f = Minecraft.class.getDeclaredField("gui");
+          			f.setAccessible(true);
+          			Object gui = f.get(mc);
+          			if (gui != null && invoke(gui, "setScreen", screen)) return;
+          		} catch (ReflectiveOperationException ignored) {
+          			// падаем в ошибку ниже
+          		}
+          		throw new IllegalStateException("locatemod: не удалось открыть экран (метод setScreen не найден)");
+          	}
+
+          	private static boolean invoke(Object target, String name, Screen screen) {
+          		try {
+          			Method m = target.getClass().getMethod(name, Screen.class);
+          			m.invoke(target, screen);
+          			return true;
+          		} catch (ReflectiveOperationException e) {
+          			return false;
+          		}
+          	}
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/java/dev/locatemod/mixin
+          cat > src/main/java/dev/locatemod/mixin/PauseScreenMixin.java <<'LOCATEMOD_EOF'
+          package dev.locatemod.mixin;
+
+          import dev.locatemod.client.LocateScreen;
+          import dev.locatemod.client.ScreenUtil;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.screens.PauseScreen;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+          import org.spongepowered.asm.mixin.Mixin;
+          import org.spongepowered.asm.mixin.injection.At;
+          import org.spongepowered.asm.mixin.injection.Inject;
+          import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
+
+          /** Добавляет кнопку «Найти» в левый верхний угол меню паузы. */
+          @Mixin(PauseScreen.class)
+          public abstract class PauseScreenMixin extends Screen {
+          	protected PauseScreenMixin(Component title) {
+          		super(title);
+          	}
+
+          	@Inject(method = "init", at = @At("TAIL"))
+          	private void locatemod$addButton(CallbackInfo ci) {
+          		this.addRenderableWidget(Button.builder(Component.literal("Найти"),
+          				b -> ScreenUtil.open(new LocateScreen()))
+          				.bounds(6, 6, 80, 20).build());
+          	}
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/fabric.mod.json <<'LOCATEMOD_EOF'
+          {
+            "schemaVersion": 1,
+            "id": "locatemod",
+            "version": "${version}",
+            "name": "Locate Menu",
+            "description": "Кнопка в меню паузы: введи название постройки или биома и получи координаты в чат.",
+            "authors": ["You"],
+            "license": "MIT",
+            "environment": "*",
+            "entrypoints": {
+              "main": ["dev.locatemod.LocateMod"]
+            },
+            "mixins": ["locatemod.mixins.json"],
+            "depends": {
+              "fabricloader": ">=0.19.2",
+              "minecraft": "~26.2",
+              "java": ">=25",
+              "fabric-api": "*"
+            }
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/resources
+          cat > src/main/resources/locatemod.mixins.json <<'LOCATEMOD_EOF'
+          {
+            "required": true,
+            "minVersion": "0.8",
+            "package": "dev.locatemod.mixin",
+            "compatibilityLevel": "JAVA_21",
+            "client": [
+              "PauseScreenMixin"
+            ],
+            "injectors": {
+              "defaultRequire": 1
+            }
+          }
+          LOCATEMOD_EOF
+          mkdir -p src/main/resources/locatemod
+          cat > src/main/resources/locatemod/aliases.json <<'LOCATEMOD_EOF'
+          [
+            {"kind":"structure","names":["деревня","village","поселение","жители","villagers"],"ids":["village_plains","village_desert","village_savanna","village_snowy","village_taiga"]},
+            {"kind":"structure","names":["аванпост","застава разбойников","pillager outpost","outpost","форпост"],"ids":["pillager_outpost"]},
+            {"kind":"structure","names":["особняк","лесной особняк","mansion","woodland mansion"],"ids":["mansion"]},
+            {"kind":"structure","names":["монумент","подводная крепость","храм океана","ocean monument","monument"],"ids":["monument"]},
+            {"kind":"structure","names":["крепость","стронгхолд","портал в энд","stronghold"],"ids":["stronghold"]},
+            {"kind":"structure","names":["шахта","заброшенная шахта","mineshaft","mine"],"ids":["mineshaft","mineshaft_mesa"]},
+            {"kind":"structure","names":["пирамида","храм в пустыне","desert pyramid","desert temple"],"ids":["desert_pyramid"]},
+            {"kind":"structure","names":["храм в джунглях","джунглевый храм","jungle temple","jungle pyramid"],"ids":["jungle_pyramid"]},
+            {"kind":"structure","names":["иглу","igloo"],"ids":["igloo"]},
+            {"kind":"structure","names":["хижина ведьмы","болотная хижина","swamp hut","witch hut"],"ids":["swamp_hut"]},
+            {"kind":"structure","names":["корабль","затонувший корабль","кораблекрушение","shipwreck"],"ids":["shipwreck","shipwreck_beached"]},
+            {"kind":"structure","names":["подводные руины","руины океана","ocean ruin","ocean ruins"],"ids":["ocean_ruin_cold","ocean_ruin_warm"]},
+            {"kind":"structure","names":["клад","сокровище","закопанный клад","buried treasure","treasure"],"ids":["buried_treasure"]},
+            {"kind":"structure","names":["разрушенный портал","руинный портал","ruined portal"],"ids":["ruined_portal","ruined_portal_desert","ruined_portal_jungle","ruined_portal_swamp","ruined_portal_mountain","ruined_portal_ocean","ruined_portal_nether"]},
+            {"kind":"structure","names":["адская крепость","незер крепость","крепость незера","nether fortress","fortress"],"ids":["fortress"]},
+            {"kind":"structure","names":["бастион","остатки бастиона","bastion","bastion remnant"],"ids":["bastion_remnant"]},
+            {"kind":"structure","names":["окаменелость","окаменелость незера","nether fossil","fossil"],"ids":["nether_fossil"]},
+            {"kind":"structure","names":["город края","энд город","город энда","end city"],"ids":["end_city"]},
+            {"kind":"structure","names":["древний город","ancient city","город","глубинная тьма город"],"ids":["ancient_city"]},
+            {"kind":"structure","names":["руины тропы","trail ruins","тропа руин"],"ids":["trail_ruins"]},
+            {"kind":"structure","names":["испытательная камера","испытания","trial chambers","trial chamber"],"ids":["trial_chambers"]},
+
+            {"kind":"biome","names":["равнины","равнина","plains"],"ids":["plains"]},
+            {"kind":"biome","names":["пустыня","desert"],"ids":["desert"]},
+            {"kind":"biome","names":["лес","forest"],"ids":["forest"]},
+            {"kind":"biome","names":["берёзовый лес","березовый лес","birch forest"],"ids":["birch_forest"]},
+            {"kind":"biome","names":["тёмный лес","темный лес","dark forest"],"ids":["dark_forest"]},
+            {"kind":"biome","names":["тайга","taiga"],"ids":["taiga"]},
+            {"kind":"biome","names":["болото","swamp"],"ids":["swamp"]},
+            {"kind":"biome","names":["мангровые заросли","мангры","mangrove swamp","mangrove"],"ids":["mangrove_swamp"]},
+            {"kind":"biome","names":["джунгли","jungle"],"ids":["jungle"]},
+            {"kind":"biome","names":["саванна","savanna"],"ids":["savanna"]},
+            {"kind":"biome","names":["пустошь","бесплодные земли","меза","badlands","mesa"],"ids":["badlands","eroded_badlands","wooded_badlands"]},
+            {"kind":"biome","names":["вишнёвая роща","вишневая роща","вишня","cherry grove","cherry"],"ids":["cherry_grove"]},
+            {"kind":"biome","names":["грибное поле","грибной остров","грибы","mushroom fields","mushroom island","mushroom"],"ids":["mushroom_fields"]},
+            {"kind":"biome","names":["ледяные шипы","ice spikes"],"ids":["ice_spikes"]},
+            {"kind":"biome","names":["снежные равнины","снег","snowy plains"],"ids":["snowy_plains"]},
+            {"kind":"biome","names":["бледный сад","pale garden"],"ids":["pale_garden"]},
+            {"kind":"biome","names":["луг","meadow"],"ids":["meadow"]},
+            {"kind":"biome","names":["острые пики","jagged peaks"],"ids":["jagged_peaks"]},
+            {"kind":"biome","names":["глубокая тьма","глубинная тьма","deep dark"],"ids":["deep_dark"]},
+            {"kind":"biome","names":["пышные пещеры","цветущие пещеры","lush caves"],"ids":["lush_caves"]},
+            {"kind":"biome","names":["карстовые пещеры","сталактитовые пещеры","dripstone caves"],"ids":["dripstone_caves"]},
+            {"kind":"biome","names":["океан","ocean"],"ids":["ocean","deep_ocean"]},
+            {"kind":"biome","names":["тёплый океан","теплый океан","warm ocean"],"ids":["warm_ocean"]},
+            {"kind":"biome","names":["пустоши нижнего мира","пустоши незера","nether wastes"],"ids":["nether_wastes"]},
+            {"kind":"biome","names":["долина душ","soul sand valley"],"ids":["soul_sand_valley"]},
+            {"kind":"biome","names":["багровый лес","crimson forest"],"ids":["crimson_forest"]},
+            {"kind":"biome","names":["искажённый лес","искаженный лес","warped forest"],"ids":["warped_forest"]},
+            {"kind":"biome","names":["базальтовые дельты","basalt deltas"],"ids":["basalt_deltas"]}
+          ]
+          LOCATEMOD_EOF
+
+      - name: Set up JDK 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 9.7.0
+
+      - name: Build mod
+        run: gradle build
+
+      - name: Upload jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: locatemod-jar
+          path: |
+            build/libs/*.jar
+            !build/libs/*-sources.jar
