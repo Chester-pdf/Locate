@@ -4,9 +4,17 @@ on:
   push:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Create project files
         run: |
@@ -23,10 +31,18 @@ jobs:
               archivesName = project.archives_base_name
           }
 
+          repositories {
+              maven {
+                  name = 'TerraformersMC'
+                  url = 'https://maven.terraformersmc.com/releases/'
+              }
+          }
+
           dependencies {
               minecraft "com.mojang:minecraft:${project.minecraft_version}"
               implementation "net.fabricmc:fabric-loader:${project.loader_version}"
               implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+              compileOnly "com.terraformersmc:modmenu:${project.modmenu_version}"
           }
 
           processResources {
@@ -38,6 +54,7 @@ jobs:
 
           tasks.withType(JavaCompile).configureEach {
               it.options.release = 25
+              it.options.encoding = 'UTF-8'
           }
 
           java {
@@ -55,6 +72,8 @@ jobs:
           loader_version=0.19.5
           loom_version=1.18.4
           fabric_api_version=0.161.0+26.2
+          # ПРОВЕРЬ на modrinth.com/mod/modmenu (Versions -> 26.2) и подставь актуальную
+          modmenu_version=18.0.0
 
           mod_version=1.0.0
           maven_group=dev.chester.locategui
@@ -79,7 +98,7 @@ jobs:
           rootProject.name = 'locate-gui'
           LOCATE_EOF
 
-          mkdir -p src/main/resources
+          mkdir -p src/main/resources/assets/locate_gui/lang
           cat > src/main/resources/fabric.mod.json <<'LOCATE_EOF'
           {
             "schemaVersion": 1,
@@ -90,14 +109,44 @@ jobs:
             "license": "MIT",
             "environment": "client",
             "entrypoints": {
-              "client": ["dev.chester.locategui.LocateModClient"]
+              "client": ["dev.chester.locategui.LocateModClient"],
+              "modmenu": ["dev.chester.locategui.LocateModMenu"]
             },
             "depends": {
               "fabricloader": ">=0.19.2",
               "minecraft": "~26.2",
               "java": ">=25",
               "fabric-api": "*"
+            },
+            "suggests": {
+              "modmenu": "*"
             }
+          }
+          LOCATE_EOF
+
+          cat > src/main/resources/assets/locate_gui/lang/en_us.json <<'LOCATE_EOF'
+          {
+            "key.locate_gui.open": "Open Locate GUI",
+            "key.category.locate_gui.main": "Locate GUI",
+            "locate_gui.screen.input": "Structure id",
+            "locate_gui.screen.find": "Locate",
+            "locate_gui.hotkey.title": "Locate GUI: hotkey",
+            "locate_gui.hotkey.current": "Open GUI key: %s",
+            "locate_gui.hotkey.waiting": "> Press a key <",
+            "locate_gui.hotkey.reset": "Reset to default"
+          }
+          LOCATE_EOF
+
+          cat > src/main/resources/assets/locate_gui/lang/ru_ru.json <<'LOCATE_EOF'
+          {
+            "key.locate_gui.open": "Открыть Locate GUI",
+            "key.category.locate_gui.main": "Locate GUI",
+            "locate_gui.screen.input": "ID структуры",
+            "locate_gui.screen.find": "Найти",
+            "locate_gui.hotkey.title": "Locate GUI: горячая клавиша",
+            "locate_gui.hotkey.current": "Клавиша открытия GUI: %s",
+            "locate_gui.hotkey.waiting": "> Нажми клавишу <",
+            "locate_gui.hotkey.reset": "Сбросить по умолчанию"
           }
           LOCATE_EOF
 
@@ -105,12 +154,172 @@ jobs:
           cat > src/main/java/dev/chester/locategui/LocateModClient.java <<'LOCATE_EOF'
           package dev.chester.locategui;
 
+          import com.mojang.blaze3d.platform.InputConstants;
           import net.fabricmc.api.ClientModInitializer;
+          import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
+          import net.fabricmc.fabric.api.client.keymapping.v1.KeyMappingHelper;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.resources.Identifier;
 
           public class LocateModClient implements ClientModInitializer {
+              public static final String MOD_ID = "locate_gui";
+              public static KeyMapping openKey;
+
               @Override
               public void onInitializeClient() {
+                  KeyMapping.Category category = KeyMapping.Category.register(
+                          Identifier.fromNamespaceAndPath(MOD_ID, "main"));
+
+                  openKey = KeyMappingHelper.registerKeyMapping(new KeyMapping(
+                          "key.locate_gui.open",
+                          InputConstants.Type.KEYSYM,
+                          InputConstants.KEY_G,
+                          category));
+
+                  ClientTickEvents.END_CLIENT_TICK.register(client -> {
+                      while (openKey.consumeClick()) {
+                          if (client.screen == null) {
+                              client.setScreen(new LocateScreen(null));
+                          }
+                      }
+                  });
+
                   System.out.println("[Locate GUI] loaded");
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/LocateScreen.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.network.chat.Component;
+
+          /** Минимальный экран: поле ввода + кнопка. Замени своей логикой RU/EN названий. */
+          public class LocateScreen extends Screen {
+              private final Screen parent;
+              private EditBox input;
+
+              public LocateScreen(Screen parent) {
+                  super(Component.literal("Locate"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = width / 2;
+                  int cy = height / 2;
+
+                  input = addRenderableWidget(new EditBox(font, cx - 100, cy - 20, 200, 20,
+                          Component.translatable("locate_gui.screen.input")));
+                  input.setHint(Component.translatable("locate_gui.screen.input"));
+                  setInitialFocus(input);
+
+                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.screen.find"), b -> {
+                      String text = input.getValue().trim();
+                      if (!text.isEmpty() && minecraft.player != null) {
+                          minecraft.player.connection.sendCommand("locate structure " + text);
+                          onClose();
+                      }
+                  }).bounds(cx - 100, cy + 5, 200, 20).build());
+              }
+
+              @Override
+              public void onClose() {
+                  minecraft.setScreen(parent);
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/HotkeyScreen.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import net.minecraft.client.KeyMapping;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.StringWidget;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.KeyEvent;
+          import net.minecraft.network.chat.CommonComponents;
+          import net.minecraft.network.chat.Component;
+
+          /** Экран из Mod Menu: переназначение клавиши открытия GUI. */
+          public class HotkeyScreen extends Screen {
+              private final Screen parent;
+              private boolean waiting;
+              private Button keyButton;
+
+              public HotkeyScreen(Screen parent) {
+                  super(Component.translatable("locate_gui.hotkey.title"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  int cx = width / 2;
+                  int cy = height / 2;
+
+                  addRenderableWidget(new StringWidget(cx - 100, cy - 45, 200, 9, title, font).alignCenter());
+
+                  keyButton = addRenderableWidget(Button.builder(label(), b -> {
+                      waiting = true;
+                      b.setMessage(Component.translatable("locate_gui.hotkey.waiting"));
+                  }).bounds(cx - 100, cy - 20, 200, 20).build());
+
+                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.hotkey.reset"),
+                          b -> apply(LocateModClient.openKey.getDefaultKey()))
+                          .bounds(cx - 100, cy + 5, 200, 20).build());
+
+                  addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, b -> onClose())
+                          .bounds(cx - 100, cy + 30, 200, 20).build());
+              }
+
+              private Component label() {
+                  return Component.translatable("locate_gui.hotkey.current",
+                          LocateModClient.openKey.getTranslatedKeyMessage());
+              }
+
+              private void apply(InputConstants.Key key) {
+                  LocateModClient.openKey.setKey(key);
+                  KeyMapping.resetMapping();
+                  minecraft.options.save();
+                  waiting = false;
+                  keyButton.setMessage(label());
+              }
+
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  if (waiting) {
+                      if (event.key() == InputConstants.KEY_ESCAPE) {
+                          waiting = false;
+                          keyButton.setMessage(label());
+                      } else {
+                          apply(InputConstants.getKey(event));
+                      }
+                      return true;
+                  }
+                  return super.keyPressed(event);
+              }
+
+              @Override
+              public void onClose() {
+                  minecraft.setScreen(parent);
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/LocateModMenu.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import com.terraformersmc.modmenu.api.ConfigScreenFactory;
+          import com.terraformersmc.modmenu.api.ModMenuApi;
+
+          public class LocateModMenu implements ModMenuApi {
+              @Override
+              public ConfigScreenFactory<?> getModConfigScreenFactory() {
+                  return HotkeyScreen::new;
               }
           }
           LOCATE_EOF
@@ -127,7 +336,7 @@ jobs:
           gradle-version: 9.7.0
 
       - name: Build mod
-        run: gradle build
+        run: gradle build --stacktrace
 
       - name: Upload jar
         uses: actions/upload-artifact@v4
@@ -136,3 +345,24 @@ jobs:
           path: |
             build/libs/*.jar
             !build/libs/*-sources.jar
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    # Релиз создаётся при пуше тега вида v1.0.1
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download jar
+        uses: actions/download-artifact@v4
+        with:
+          name: locate-gui-jar
+          path: dist
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.jar
