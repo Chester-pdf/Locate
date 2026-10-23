@@ -609,7 +609,7 @@ jobs:
                           Component message = describe(entry, origin, result);
                           out.accept(message);
                           if (mc.player != null) {
-                              mc.player.displayClientMessage(message, false);
+                              mc.player.sendSystemMessage(message);
                           }
                       });
                   });
@@ -691,9 +691,9 @@ jobs:
         if: failure()
         run: |
           CP=$(gradle -q printMcClasspath | grep '^CP:' | sed 's/^CP://' | tr '\n' ':')
-          for c in net.minecraft.client.Minecraft net.minecraft.client.gui.Gui net.minecraft.client.gui.components.StringWidget; do
+          for c in net.minecraft.client.Minecraft net.minecraft.client.gui.Gui net.minecraft.client.gui.components.StringWidget net.minecraft.client.player.LocalPlayer net.minecraft.client.gui.components.ChatComponent; do
             echo "=== $c ==="
-            javap -cp "$CP" "$c" | grep -iE 'screen|align|class ' || true
+            javap -cp "$CP" "$c" | grep -iE 'screen|align|class |message|chat' || true
           done
 
       - name: Upload jar
