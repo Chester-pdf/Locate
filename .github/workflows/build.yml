@@ -134,8 +134,13 @@ jobs:
           {
             "key.locate_gui.open": "Open Locate GUI",
             "key.category.locate_gui.main": "Locate GUI",
-            "locate_gui.screen.input": "Structure id",
+            "locate_gui.screen.input": "Name (e.g. village)",
             "locate_gui.screen.find": "Locate",
+            "locate_gui.result.searching": "Searching: %s...",
+            "locate_gui.result.found": "%1$s: X %2$s, Z %3$s (%4$s blocks)",
+            "locate_gui.result.not_found": "\"%s\" not found nearby",
+            "locate_gui.result.unknown": "Unknown name: %s",
+            "locate_gui.result.command_sent": "Server: /locate sent, see chat for the result",
             "locate_gui.hotkey.title": "Locate GUI: hotkey",
             "locate_gui.hotkey.current": "Open GUI key: %s",
             "locate_gui.hotkey.waiting": "> Press a key <",
@@ -147,8 +152,13 @@ jobs:
           {
             "key.locate_gui.open": "Открыть Locate GUI",
             "key.category.locate_gui.main": "Locate GUI",
-            "locate_gui.screen.input": "ID структуры",
+            "locate_gui.screen.input": "Название (например, деревня)",
             "locate_gui.screen.find": "Найти",
+            "locate_gui.result.searching": "Ищу: %s...",
+            "locate_gui.result.found": "%1$s: X %2$s, Z %3$s (%4$s бл.)",
+            "locate_gui.result.not_found": "«%s» не найдено поблизости",
+            "locate_gui.result.unknown": "Неизвестное название: %s",
+            "locate_gui.result.command_sent": "Сервер: отправлена /locate, результат в чате",
             "locate_gui.hotkey.title": "Locate GUI: горячая клавиша",
             "locate_gui.hotkey.current": "Клавиша открытия GUI: %s",
             "locate_gui.hotkey.waiting": "> Нажми клавишу <",
@@ -198,15 +208,19 @@ jobs:
           cat > src/main/java/dev/chester/locategui/LocateScreen.java <<'LOCATE_EOF'
           package dev.chester.locategui;
 
+          import com.mojang.blaze3d.platform.InputConstants;
           import net.minecraft.client.gui.components.Button;
           import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.components.StringWidget;
           import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.KeyEvent;
           import net.minecraft.network.chat.Component;
 
-          /** Минимальный экран: поле ввода + кнопка. Замени своей логикой RU/EN названий. */
+          /** Поле ввода (RU/EN название) + кнопка. Поиск идёт напрямую, без команды /locate. */
           public class LocateScreen extends Screen {
               private final Screen parent;
               private EditBox input;
+              private StringWidget status;
 
               public LocateScreen(Screen parent) {
                   super(Component.literal("Locate"));
@@ -220,16 +234,37 @@ jobs:
 
                   input = addRenderableWidget(new EditBox(font, cx - 100, cy - 20, 200, 20,
                           Component.translatable("locate_gui.screen.input")));
+                  input.setMaxLength(64);
                   input.setHint(Component.translatable("locate_gui.screen.input"));
                   setInitialFocus(input);
 
-                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.screen.find"), b -> {
-                      String text = input.getValue().trim();
-                      if (!text.isEmpty() && minecraft.player != null) {
-                          minecraft.player.connection.sendCommand("locate structure " + text);
-                          onClose();
-                      }
-                  }).bounds(cx - 100, cy + 5, 200, 20).build());
+                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.screen.find"), b -> search())
+                          .bounds(cx - 100, cy + 5, 200, 20).build());
+
+                  status = addRenderableWidget(new StringWidget(cx - 150, cy + 35, 300, 9, Component.empty(), font));
+              }
+
+              private void search() {
+                  String text = input.getValue().trim();
+                  if (text.isEmpty()) {
+                      return;
+                  }
+                  Names.Entry entry = Names.resolve(text);
+                  if (entry == null) {
+                      status.setMessage(Component.translatable("locate_gui.result.unknown", text));
+                      return;
+                  }
+                  LocateSearch.run(minecraft, entry, status::setMessage);
+              }
+
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  if (input.isFocused()
+                          && (event.key() == InputConstants.KEY_RETURN || event.key() == InputConstants.KEY_NUMPADENTER)) {
+                      search();
+                      return true;
+                  }
+                  return super.keyPressed(event);
               }
 
               @Override
@@ -312,6 +347,308 @@ jobs:
               @Override
               public void onClose() {
                   minecraft.gui.setScreen(parent);
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/Names.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import java.util.ArrayList;
+          import java.util.LinkedHashMap;
+          import java.util.List;
+          import java.util.Locale;
+          import java.util.Map;
+          import java.util.regex.Pattern;
+
+          /** Словарь: русские и английские названия -> структура/биом из команды /locate. */
+          public final class Names {
+              public enum Kind {
+                  STRUCTURE("structure"),
+                  BIOME("biome");
+
+                  public final String command;
+
+                  Kind(String command) {
+                      this.command = command;
+                  }
+              }
+
+              /** tag = true значит "#minecraft:village" (тег), иначе конкретный id. */
+              public record Entry(Kind kind, String namespace, String path, boolean tag, String label) {
+                  public String id() {
+                      return namespace + ":" + path;
+                  }
+
+                  public String arg() {
+                      return (tag ? "#" : "") + id();
+                  }
+              }
+
+              private static final Map<String, Entry> LOOKUP = new LinkedHashMap<>();
+              private static final Pattern RAW_ID = Pattern.compile("#?[a-z0-9_.-]+(:[a-z0-9_./-]+)?");
+
+              static {
+                  // ---------- Структуры ----------
+                  structTag("village", "деревня", "деревни", "поселение");
+                  struct("stronghold", "крепость", "стронгхолд");
+                  structTag("mineshaft", "шахта", "заброшенная шахта");
+                  struct("desert_pyramid", "пирамида в пустыне", "пустынный храм", "храм в пустыне");
+                  struct("jungle_temple", "храм в джунглях", "джунглевый храм");
+                  struct("swamp_hut", "хижина ведьмы", "болотная хижина", "хижина в болоте");
+                  struct("igloo", "иглу");
+                  struct("pillager_outpost", "форпост разбойников", "аванпост разбойников", "форпост", "аванпост");
+                  struct("mansion", "лесной особняк", "особняк", "woodland mansion");
+                  struct("monument", "океанический монумент", "подводный храм", "монумент", "ocean monument");
+                  structTag("ocean_ruin", "подводные руины", "руины в океане", "океанские руины");
+                  structTag("shipwreck", "кораблекрушение", "затонувший корабль", "корабль");
+                  struct("buried_treasure", "клад", "закопанное сокровище", "сокровище");
+                  struct("ancient_city", "древний город");
+                  structTag("ruined_portal", "руины портала", "разрушенный портал");
+                  struct("bastion_remnant", "бастион", "остатки бастиона", "bastion");
+                  struct("fortress", "незер крепость", "адская крепость", "крепость незера", "крепость нижнего мира");
+                  struct("end_city", "город края", "энд город", "город энда");
+                  struct("trial_chambers", "залы испытаний", "испытательные залы", "камеры испытаний");
+                  struct("trail_ruins", "руины тропы", "руины на тропе");
+                  struct("nether_fossil", "ископаемое незера", "незер ископаемое");
+
+                  // ---------- Биомы ----------
+                  biome("plains", "равнины");
+                  biome("sunflower_plains", "подсолнуховые равнины");
+                  biome("snowy_plains", "снежные равнины");
+                  biome("ice_spikes", "ледяные шипы");
+                  biome("forest", "лес");
+                  biome("birch_forest", "берёзовый лес");
+                  biome("dark_forest", "тёмный лес");
+                  biome("flower_forest", "цветочный лес");
+                  biome("pale_garden", "бледный сад");
+                  biome("taiga", "тайга");
+                  biome("snowy_taiga", "снежная тайга");
+                  biome("old_growth_pine_taiga", "древняя сосновая тайга", "гигантская тайга");
+                  biome("jungle", "джунгли");
+                  biome("bamboo_jungle", "бамбуковые джунгли");
+                  biome("sparse_jungle", "редкие джунгли");
+                  biome("desert", "пустыня");
+                  biome("savanna", "саванна");
+                  biome("badlands", "бесплодные земли", "меза");
+                  biome("eroded_badlands", "эродированные бесплодные земли");
+                  biome("wooded_badlands", "лесистые бесплодные земли");
+                  biome("swamp", "болото");
+                  biome("mangrove_swamp", "мангровое болото", "мангровые заросли");
+                  biome("mushroom_fields", "грибное поле", "грибной остров");
+                  biome("cherry_grove", "вишнёвая роща");
+                  biome("meadow", "луг");
+                  biome("grove", "роща");
+                  biome("snowy_slopes", "заснеженные склоны");
+                  biome("jagged_peaks", "зубчатые пики");
+                  biome("frozen_peaks", "замёрзшие пики");
+                  biome("stony_peaks", "каменистые пики");
+                  biome("windswept_hills", "ветреные холмы");
+                  biome("beach", "пляж");
+                  biome("snowy_beach", "снежный пляж");
+                  biome("stony_shore", "каменистый берег");
+                  biome("river", "река");
+                  biome("frozen_river", "замёрзшая река");
+                  biome("ocean", "океан");
+                  biome("deep_ocean", "глубокий океан");
+                  biome("warm_ocean", "тёплый океан");
+                  biome("lukewarm_ocean", "умеренный океан");
+                  biome("cold_ocean", "холодный океан");
+                  biome("frozen_ocean", "замёрзший океан");
+                  biome("dripstone_caves", "капельниковые пещеры");
+                  biome("lush_caves", "пышные пещеры");
+                  biome("deep_dark", "глубокая тьма");
+                  biome("nether_wastes", "пустоши нижнего мира", "пустоши незера");
+                  biome("soul_sand_valley", "долина песка душ");
+                  biome("crimson_forest", "багровый лес");
+                  biome("warped_forest", "искажённый лес");
+                  biome("basalt_deltas", "базальтовые дельты");
+                  biome("the_end", "край");
+                  biome("end_highlands", "высокогорья края");
+                  biome("end_midlands", "средние земли края");
+                  biome("small_end_islands", "малые острова края");
+                  biome("end_barrens", "пустоши края");
+              }
+
+              private Names() {
+              }
+
+              private static void struct(String path, String ru, String... aliases) {
+                  add(Kind.STRUCTURE, path, false, ru, aliases);
+              }
+
+              private static void structTag(String path, String ru, String... aliases) {
+                  add(Kind.STRUCTURE, path, true, ru, aliases);
+              }
+
+              private static void biome(String path, String ru, String... aliases) {
+                  add(Kind.BIOME, path, false, ru, aliases);
+              }
+
+              private static void add(Kind kind, String path, boolean tag, String ru, String... aliases) {
+                  String label = ru.substring(0, 1).toUpperCase(Locale.ROOT) + ru.substring(1);
+                  Entry e = new Entry(kind, "minecraft", path, tag, label);
+                  LOOKUP.put(norm(ru), e);
+                  LOOKUP.putIfAbsent(norm(path), e);
+                  for (String a : aliases) {
+                      LOOKUP.putIfAbsent(norm(a), e);
+                  }
+              }
+
+              private static String norm(String s) {
+                  return s.toLowerCase(Locale.ROOT)
+                          .replace('ё', 'е')
+                          .replace("minecraft:", "")
+                          .replace('_', ' ')
+                          .trim()
+                          .replaceAll("\\s+", " ");
+              }
+
+              /** Возвращает запись по русскому/английскому названию или null, если не понял. */
+              public static Entry resolve(String input) {
+                  String raw = input.trim().toLowerCase(Locale.ROOT);
+                  if (raw.startsWith("/")) {
+                      raw = raw.substring(1).trim();
+                  }
+                  if (raw.isEmpty()) {
+                      return null;
+                  }
+                  String key = norm(raw.startsWith("#") ? raw.substring(1) : raw);
+
+                  Entry exact = LOOKUP.get(key);
+                  if (exact != null) {
+                      return exact;
+                  }
+
+                  // Единственное совпадение по началу слова: "дерев" -> деревня
+                  List<Entry> matches = new ArrayList<>();
+                  for (Map.Entry<String, Entry> me : LOOKUP.entrySet()) {
+                      if (me.getKey().startsWith(key) && !matches.contains(me.getValue())) {
+                          matches.add(me.getValue());
+                      }
+                  }
+                  if (matches.size() == 1) {
+                      return matches.get(0);
+                  }
+
+                  // Сырой id (например modid:structure или #minecraft:village) - как структура
+                  if (RAW_ID.matcher(raw).matches()) {
+                      boolean tag = raw.startsWith("#");
+                      String id = tag ? raw.substring(1) : raw;
+                      int i = id.indexOf(':');
+                      String ns = i < 0 ? "minecraft" : id.substring(0, i);
+                      String path = i < 0 ? id : id.substring(i + 1);
+                      return new Entry(Kind.STRUCTURE, ns, path, tag, raw);
+                  }
+                  return null;
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/LocateSearch.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import com.mojang.datafixers.util.Pair;
+          import java.util.Optional;
+          import java.util.function.Consumer;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.core.BlockPos;
+          import net.minecraft.core.Holder;
+          import net.minecraft.core.HolderSet;
+          import net.minecraft.core.Registry;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.tags.TagKey;
+          import net.minecraft.world.level.Level;
+          import net.minecraft.world.level.biome.Biome;
+          import net.minecraft.world.level.levelgen.structure.Structure;
+
+          /**
+           * Собственный поиск структур и биомов (замена /locate).
+           * В одиночной игре идёт напрямую через встроенный сервер, команда и читы не нужны.
+           * На чужом сервере у клиента нет данных мира, поэтому там остаётся только запасной вариант - команда.
+           */
+          public final class LocateSearch {
+              private LocateSearch() {
+              }
+
+              public static void run(Minecraft mc, Names.Entry entry, Consumer<Component> out) {
+                  if (mc.player == null || mc.level == null) {
+                      return;
+                  }
+
+                  MinecraftServer server = mc.getSingleplayerServer();
+                  if (server == null) {
+                      mc.player.connection.sendCommand("locate " + entry.kind().command + " " + entry.arg());
+                      out.accept(Component.translatable("locate_gui.result.command_sent"));
+                      return;
+                  }
+
+                  BlockPos origin = mc.player.blockPosition();
+                  ResourceKey<Level> dimension = mc.level.dimension();
+                  out.accept(Component.translatable("locate_gui.result.searching", entry.label()));
+
+                  server.execute(() -> {
+                      BlockPos found = null;
+                      ServerLevel level = server.getLevel(dimension);
+                      if (level != null) {
+                          try {
+                              found = entry.kind() == Names.Kind.STRUCTURE
+                                      ? findStructure(level, entry, origin)
+                                      : findBiome(level, entry, origin);
+                          } catch (RuntimeException e) {
+                              found = null;
+                          }
+                      }
+                      BlockPos result = found;
+                      mc.execute(() -> out.accept(describe(entry, origin, result)));
+                  });
+              }
+
+              private static BlockPos findStructure(ServerLevel level, Names.Entry entry, BlockPos origin) {
+                  Registry<Structure> registry = level.registryAccess().lookupOrThrow(Registries.STRUCTURE);
+                  Identifier id = Identifier.fromNamespaceAndPath(entry.namespace(), entry.path());
+
+                  HolderSet<Structure> set;
+                  if (entry.tag()) {
+                      Optional<HolderSet.Named<Structure>> named = registry.get(TagKey.create(Registries.STRUCTURE, id));
+                      if (named.isEmpty()) {
+                          return null;
+                      }
+                      set = named.get();
+                  } else {
+                      Optional<Holder.Reference<Structure>> ref = registry.get(ResourceKey.create(Registries.STRUCTURE, id));
+                      if (ref.isEmpty()) {
+                          return null;
+                      }
+                      set = HolderSet.direct(ref.get());
+                  }
+
+                  Pair<BlockPos, Holder<Structure>> pair =
+                          level.getChunkSource().getGenerator().findNearestMapStructure(level, set, origin, 100, false);
+                  return pair == null ? null : pair.getFirst();
+              }
+
+              private static BlockPos findBiome(ServerLevel level, Names.Entry entry, BlockPos origin) {
+                  ResourceKey<Biome> key = ResourceKey.create(Registries.BIOME,
+                          Identifier.fromNamespaceAndPath(entry.namespace(), entry.path()));
+                  Pair<BlockPos, Holder<Biome>> pair =
+                          level.findClosestBiome3d(holder -> holder.is(key), origin, 6400, 32, 64);
+                  return pair == null ? null : pair.getFirst();
+              }
+
+              private static Component describe(Names.Entry entry, BlockPos origin, BlockPos pos) {
+                  if (pos == null) {
+                      return Component.translatable("locate_gui.result.not_found", entry.label());
+                  }
+                  double dx = pos.getX() - origin.getX();
+                  double dz = pos.getZ() - origin.getZ();
+                  long dist = Math.round(Math.sqrt(dx * dx + dz * dz));
+                  return Component.translatable("locate_gui.result.found", entry.label(), pos.getX(), pos.getZ(), dist);
               }
           }
           LOCATE_EOF
