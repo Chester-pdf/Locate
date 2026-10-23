@@ -111,7 +111,7 @@ jobs:
             "id": "locate_gui",
             "version": "${version}",
             "name": "Locate GUI",
-            "description": "Button + text input analogue of /locate with RU/EN names.",
+            "description": "Button + text input analogue of /locate with RU/EN names, plus teleport points.",
             "license": "MIT",
             "environment": "client",
             "entrypoints": {
@@ -136,6 +136,7 @@ jobs:
             "key.category.locate_gui.main": "Locate GUI",
             "locate_gui.screen.input": "Name (e.g. village)",
             "locate_gui.screen.find": "Locate",
+            "locate_gui.screen.waypoints": "Teleport points",
             "locate_gui.result.searching": "Searching: %s...",
             "locate_gui.result.found": "%1$s: X %2$s, Z %3$s (%4$s blocks)",
             "locate_gui.result.not_found": "\"%s\" not found nearby",
@@ -144,7 +145,23 @@ jobs:
             "locate_gui.hotkey.title": "Locate GUI: hotkey",
             "locate_gui.hotkey.current": "Open GUI key: %s",
             "locate_gui.hotkey.waiting": "> Press a key <",
-            "locate_gui.hotkey.reset": "Reset to default"
+            "locate_gui.hotkey.reset": "Reset to default",
+            "locate_gui.wp.title": "Teleport points",
+            "locate_gui.wp.name": "Point name",
+            "locate_gui.wp.save": "Save here",
+            "locate_gui.wp.entry": "%1$s [%2$s]  %3$s %4$s %5$s",
+            "locate_gui.wp.empty": "No points yet",
+            "locate_gui.wp.page": "%1$s / %2$s",
+            "locate_gui.wp.saved": "Saved: %s",
+            "locate_gui.wp.updated": "Updated: %s",
+            "locate_gui.wp.deleted": "Deleted: %s",
+            "locate_gui.wp.need_name": "Enter a point name",
+            "locate_gui.wp.teleported": "Teleported: %s",
+            "locate_gui.wp.failed": "Could not teleport to \"%s\"",
+            "locate_gui.wp.command_sent": "Server: /tp to \"%s\" sent (needs permission)",
+            "locate_gui.dim.overworld": "Overworld",
+            "locate_gui.dim.the_nether": "Nether",
+            "locate_gui.dim.the_end": "End"
           }
           LOCATE_EOF
 
@@ -154,6 +171,7 @@ jobs:
             "key.category.locate_gui.main": "Locate GUI",
             "locate_gui.screen.input": "Название (например, деревня)",
             "locate_gui.screen.find": "Найти",
+            "locate_gui.screen.waypoints": "Тп-точки",
             "locate_gui.result.searching": "Ищу: %s...",
             "locate_gui.result.found": "%1$s: X %2$s, Z %3$s (%4$s бл.)",
             "locate_gui.result.not_found": "«%s» не найдено поблизости",
@@ -162,7 +180,23 @@ jobs:
             "locate_gui.hotkey.title": "Locate GUI: горячая клавиша",
             "locate_gui.hotkey.current": "Клавиша открытия GUI: %s",
             "locate_gui.hotkey.waiting": "> Нажми клавишу <",
-            "locate_gui.hotkey.reset": "Сбросить по умолчанию"
+            "locate_gui.hotkey.reset": "Сбросить по умолчанию",
+            "locate_gui.wp.title": "Тп-точки",
+            "locate_gui.wp.name": "Название точки",
+            "locate_gui.wp.save": "Сохранить",
+            "locate_gui.wp.entry": "%1$s [%2$s]  %3$s %4$s %5$s",
+            "locate_gui.wp.empty": "Точек пока нет",
+            "locate_gui.wp.page": "%1$s / %2$s",
+            "locate_gui.wp.saved": "Точка сохранена: %s",
+            "locate_gui.wp.updated": "Точка обновлена: %s",
+            "locate_gui.wp.deleted": "Точка удалена: %s",
+            "locate_gui.wp.need_name": "Введи название точки",
+            "locate_gui.wp.teleported": "Телепорт: %s",
+            "locate_gui.wp.failed": "Не удалось телепортироваться: «%s»",
+            "locate_gui.wp.command_sent": "Сервер: отправлена /tp на «%s» (нужны права)",
+            "locate_gui.dim.overworld": "Верхний мир",
+            "locate_gui.dim.the_nether": "Незер",
+            "locate_gui.dim.the_end": "Энд"
           }
           LOCATE_EOF
 
@@ -241,7 +275,11 @@ jobs:
                   addRenderableWidget(Button.builder(Component.translatable("locate_gui.screen.find"), b -> search())
                           .bounds(cx - 100, cy + 5, 200, 20).build());
 
-                  status = addRenderableWidget(new StringWidget(cx - 150, cy + 35, 300, 9, Component.empty(), font));
+                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.screen.waypoints"),
+                          b -> minecraft.gui.setScreen(new WaypointsScreen(this)))
+                          .bounds(cx - 100, cy + 30, 200, 20).build());
+
+                  status = addRenderableWidget(new StringWidget(cx - 150, cy + 58, 300, 9, Component.empty(), font));
               }
 
               private void search() {
@@ -270,6 +308,356 @@ jobs:
               @Override
               public void onClose() {
                   minecraft.gui.setScreen(parent);
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/WaypointsScreen.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import com.mojang.blaze3d.platform.InputConstants;
+          import java.util.List;
+          import net.minecraft.client.gui.components.Button;
+          import net.minecraft.client.gui.components.EditBox;
+          import net.minecraft.client.gui.components.StringWidget;
+          import net.minecraft.client.gui.screens.Screen;
+          import net.minecraft.client.input.KeyEvent;
+          import net.minecraft.client.player.LocalPlayer;
+          import net.minecraft.network.chat.CommonComponents;
+          import net.minecraft.network.chat.Component;
+
+          /** Тп-точки: вводишь название и сохраняешь текущую позицию, клик по точке - телепорт. */
+          public class WaypointsScreen extends Screen {
+              private static final int PAGE_SIZE = 4;
+              private static final int ROW_W = 190;
+              private static final int ROW_H = 24;
+
+              private final Screen parent;
+              private EditBox nameInput;
+              private StringWidget status;
+              private Component statusMsg = Component.empty();
+              private int page;
+
+              public WaypointsScreen(Screen parent) {
+                  super(Component.translatable("locate_gui.wp.title"));
+                  this.parent = parent;
+              }
+
+              @Override
+              protected void init() {
+                  String keep = nameInput == null ? "" : nameInput.getValue();
+                  int cx = width / 2;
+                  int left = cx - 107;
+                  int y = Math.max(6, (height - 200) / 2);
+
+                  addRenderableWidget(new StringWidget(cx - font.width(title) / 2, y, font.width(title), 9, title, font));
+                  y += 16;
+
+                  nameInput = addRenderableWidget(new EditBox(font, left, y, 150, 20,
+                          Component.translatable("locate_gui.wp.name")));
+                  nameInput.setMaxLength(24);
+                  nameInput.setHint(Component.translatable("locate_gui.wp.name"));
+                  nameInput.setValue(keep);
+                  setInitialFocus(nameInput);
+
+                  addRenderableWidget(Button.builder(Component.translatable("locate_gui.wp.save"), b -> save())
+                          .bounds(left + 154, y, 60, 20).build());
+                  y += 26;
+
+                  List<Waypoints.Point> points = Waypoints.all();
+                  int pages = Math.max(1, (points.size() + PAGE_SIZE - 1) / PAGE_SIZE);
+                  page = Math.max(0, Math.min(page, pages - 1));
+
+                  int listTop = y;
+                  if (points.isEmpty()) {
+                      addRenderableWidget(new StringWidget(cx - 100, listTop + 6, 200, 9,
+                              Component.translatable("locate_gui.wp.empty"), font));
+                  }
+                  int from = page * PAGE_SIZE;
+                  int to = Math.min(points.size(), from + PAGE_SIZE);
+                  for (int i = from; i < to; i++) {
+                      Waypoints.Point p = points.get(i);
+                      int rowY = listTop + (i - from) * ROW_H;
+
+                      addRenderableWidget(Button.builder(
+                              Component.translatable("locate_gui.wp.entry", p.name(), Waypoints.dimLabel(p.dimension()),
+                                      p.bx(), p.by(), p.bz()),
+                              b -> teleport(p))
+                              .bounds(left, rowY, ROW_W, 20).build());
+
+                      addRenderableWidget(Button.builder(Component.literal("X"), b -> {
+                          Waypoints.remove(p);
+                          statusMsg = Component.translatable("locate_gui.wp.deleted", p.name());
+                          rebuildWidgets();
+                      }).bounds(left + ROW_W + 4, rowY, 20, 20).build());
+                  }
+                  y = listTop + PAGE_SIZE * ROW_H + 2;
+
+                  addRenderableWidget(Button.builder(Component.literal("<"), b -> {
+                      if (page > 0) {
+                          page--;
+                          rebuildWidgets();
+                      }
+                  }).bounds(left, y, 20, 20).build());
+                  addRenderableWidget(new StringWidget(cx - 40, y + 6, 80, 9,
+                          Component.translatable("locate_gui.wp.page", page + 1, pages), font));
+                  addRenderableWidget(Button.builder(Component.literal(">"), b -> {
+                      if (page < pages - 1) {
+                          page++;
+                          rebuildWidgets();
+                      }
+                  }).bounds(left + ROW_W + 4, y, 20, 20).build());
+                  y += 24;
+
+                  status = addRenderableWidget(new StringWidget(cx - 150, y, 300, 9, statusMsg, font));
+                  y += 14;
+
+                  addRenderableWidget(Button.builder(CommonComponents.GUI_DONE, b -> onClose())
+                          .bounds(left, y, 214, 20).build());
+              }
+
+              private void save() {
+                  String name = nameInput.getValue().replaceAll("\\s+", " ").trim();
+                  if (name.isEmpty()) {
+                      statusMsg = Component.translatable("locate_gui.wp.need_name");
+                      status.setMessage(statusMsg);
+                      return;
+                  }
+                  LocalPlayer player = minecraft.player;
+                  if (player == null || minecraft.level == null) {
+                      return;
+                  }
+                  boolean replaced = Waypoints.add(new Waypoints.Point(name,
+                          minecraft.level.dimension().identifier().toString(),
+                          player.getX(), player.getY(), player.getZ()));
+                  statusMsg = Component.translatable(replaced ? "locate_gui.wp.updated" : "locate_gui.wp.saved", name);
+                  nameInput.setValue("");
+                  page = Integer.MAX_VALUE; // уйти на последнюю страницу, там новая точка
+                  rebuildWidgets();
+              }
+
+              private void teleport(Waypoints.Point p) {
+                  Teleport.go(minecraft, p, msg -> {
+                      if (minecraft.player != null) {
+                          minecraft.player.sendSystemMessage(msg);
+                      }
+                  });
+                  minecraft.gui.setScreen(null);
+              }
+
+              @Override
+              public boolean keyPressed(KeyEvent event) {
+                  if (nameInput.isFocused()
+                          && (event.key() == InputConstants.KEY_RETURN || event.key() == InputConstants.KEY_NUMPADENTER)) {
+                      save();
+                      return true;
+                  }
+                  return super.keyPressed(event);
+              }
+
+              @Override
+              public void onClose() {
+                  minecraft.gui.setScreen(parent);
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/Waypoints.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import java.io.IOException;
+          import java.nio.charset.StandardCharsets;
+          import java.nio.file.Files;
+          import java.nio.file.Path;
+          import java.util.ArrayList;
+          import java.util.List;
+          import net.fabricmc.loader.api.FabricLoader;
+          import net.minecraft.network.chat.Component;
+
+          /** Хранилище тп-точек: config/locate_gui_waypoints.txt, строка = имя, измерение, x, y, z через TAB. */
+          public final class Waypoints {
+              public record Point(String name, String dimension, double x, double y, double z) {
+                  public int bx() {
+                      return (int) Math.floor(x);
+                  }
+
+                  public int by() {
+                      return (int) Math.floor(y);
+                  }
+
+                  public int bz() {
+                      return (int) Math.floor(z);
+                  }
+              }
+
+              private static final List<Point> POINTS = new ArrayList<>();
+              private static boolean loaded;
+
+              private Waypoints() {
+              }
+
+              private static Path file() {
+                  return FabricLoader.getInstance().getConfigDir().resolve("locate_gui_waypoints.txt");
+              }
+
+              public static synchronized List<Point> all() {
+                  load();
+                  return new ArrayList<>(POINTS);
+              }
+
+              /** Возвращает true, если точка с таким именем уже была и её обновили. */
+              public static synchronized boolean add(Point p) {
+                  load();
+                  boolean replaced = false;
+                  for (int i = 0; i < POINTS.size(); i++) {
+                      if (POINTS.get(i).name().equalsIgnoreCase(p.name())) {
+                          POINTS.set(i, p);
+                          replaced = true;
+                          break;
+                      }
+                  }
+                  if (!replaced) {
+                      POINTS.add(p);
+                  }
+                  save();
+                  return replaced;
+              }
+
+              public static synchronized void remove(Point p) {
+                  load();
+                  POINTS.removeIf(q -> q.name().equalsIgnoreCase(p.name()));
+                  save();
+              }
+
+              public static Component dimLabel(String dim) {
+                  return switch (dim) {
+                      case "minecraft:overworld" -> Component.translatable("locate_gui.dim.overworld");
+                      case "minecraft:the_nether" -> Component.translatable("locate_gui.dim.the_nether");
+                      case "minecraft:the_end" -> Component.translatable("locate_gui.dim.the_end");
+                      default -> Component.literal(dim);
+                  };
+              }
+
+              private static void load() {
+                  if (loaded) {
+                      return;
+                  }
+                  loaded = true;
+                  Path f = file();
+                  if (!Files.exists(f)) {
+                      return;
+                  }
+                  try {
+                      for (String line : Files.readAllLines(f, StandardCharsets.UTF_8)) {
+                          String[] parts = line.split("\t");
+                          if (parts.length != 5) {
+                              continue;
+                          }
+                          try {
+                              POINTS.add(new Point(parts[0], parts[1],
+                                      Double.parseDouble(parts[2]),
+                                      Double.parseDouble(parts[3]),
+                                      Double.parseDouble(parts[4])));
+                          } catch (NumberFormatException ignored) {
+                              // битую строку пропускаем
+                          }
+                      }
+                  } catch (IOException e) {
+                      System.out.println("[Locate GUI] cannot read waypoints: " + e);
+                  }
+              }
+
+              private static void save() {
+                  List<String> lines = new ArrayList<>();
+                  for (Point p : POINTS) {
+                      lines.add(p.name() + "\t" + p.dimension() + "\t" + p.x() + "\t" + p.y() + "\t" + p.z());
+                  }
+                  try {
+                      Files.write(file(), lines, StandardCharsets.UTF_8);
+                  } catch (IOException e) {
+                      System.out.println("[Locate GUI] cannot save waypoints: " + e);
+                  }
+              }
+          }
+          LOCATE_EOF
+
+          cat > src/main/java/dev/chester/locategui/Teleport.java <<'LOCATE_EOF'
+          package dev.chester.locategui;
+
+          import java.util.Locale;
+          import java.util.Set;
+          import java.util.UUID;
+          import java.util.function.Consumer;
+          import net.minecraft.client.Minecraft;
+          import net.minecraft.core.registries.Registries;
+          import net.minecraft.network.chat.Component;
+          import net.minecraft.resources.Identifier;
+          import net.minecraft.resources.ResourceKey;
+          import net.minecraft.server.MinecraftServer;
+          import net.minecraft.server.level.ServerLevel;
+          import net.minecraft.server.level.ServerPlayer;
+          import net.minecraft.world.level.Level;
+
+          /**
+           * Телепорт на сохранённую точку.
+           * В одиночной игре - напрямую через встроенный сервер (читы не нужны, работает и между измерениями).
+           * На чужом сервере - командой /tp, поэтому там нужны права.
+           */
+          public final class Teleport {
+              private Teleport() {
+              }
+
+              public static void go(Minecraft mc, Waypoints.Point p, Consumer<Component> out) {
+                  if (mc.player == null || mc.level == null) {
+                      return;
+                  }
+
+                  MinecraftServer server = mc.getSingleplayerServer();
+                  if (server == null) {
+                      String currentDim = mc.level.dimension().identifier().toString();
+                      String tp = String.format(Locale.ROOT, "tp @s %.2f %.2f %.2f", p.x(), p.y(), p.z());
+                      mc.player.connection.sendCommand(
+                              p.dimension().equals(currentDim) ? tp : "execute in " + p.dimension() + " run " + tp);
+                      out.accept(Component.translatable("locate_gui.wp.command_sent", p.name()));
+                      return;
+                  }
+
+                  ResourceKey<Level> dimension = dimensionKey(p.dimension());
+                  if (dimension == null) {
+                      out.accept(Component.translatable("locate_gui.wp.failed", p.name()));
+                      return;
+                  }
+                  UUID id = mc.player.getUUID();
+
+                  server.execute(() -> {
+                      boolean ok = false;
+                      try {
+                          ServerLevel level = server.getLevel(dimension);
+                          ServerPlayer player = server.getPlayerList().getPlayer(id);
+                          if (level != null && player != null) {
+                              player.teleportTo(level, p.x(), p.y(), p.z(), Set.of(),
+                                      player.getYRot(), player.getXRot(), true);
+                              ok = true;
+                          }
+                      } catch (RuntimeException e) {
+                          ok = false;
+                      }
+                      boolean result = ok;
+                      mc.execute(() -> out.accept(Component.translatable(
+                              result ? "locate_gui.wp.teleported" : "locate_gui.wp.failed", p.name())));
+                  });
+              }
+
+              private static ResourceKey<Level> dimensionKey(String dim) {
+                  try {
+                      int i = dim.indexOf(':');
+                      Identifier id = i < 0
+                              ? Identifier.fromNamespaceAndPath("minecraft", dim)
+                              : Identifier.fromNamespaceAndPath(dim.substring(0, i), dim.substring(i + 1));
+                      return ResourceKey.create(Registries.DIMENSION, id);
+                  } catch (RuntimeException e) {
+                      return null;
+                  }
               }
           }
           LOCATE_EOF
@@ -691,9 +1079,9 @@ jobs:
         if: failure()
         run: |
           CP=$(gradle -q printMcClasspath | grep '^CP:' | sed 's/^CP://' | tr '\n' ':')
-          for c in net.minecraft.client.Minecraft net.minecraft.client.gui.Gui net.minecraft.client.gui.components.StringWidget net.minecraft.client.player.LocalPlayer net.minecraft.client.gui.components.ChatComponent; do
+          for c in net.minecraft.client.Minecraft net.minecraft.client.gui.Gui net.minecraft.client.gui.components.StringWidget net.minecraft.client.player.LocalPlayer net.minecraft.client.gui.components.ChatComponent net.minecraft.server.level.ServerPlayer net.minecraft.resources.ResourceKey; do
             echo "=== $c ==="
-            javap -cp "$CP" "$c" | grep -iE 'screen|align|class |message|chat' || true
+            javap -cp "$CP" "$c" | grep -iE 'screen|align|class |message|chat|teleport|identifier' || true
           done
 
       - name: Upload jar
